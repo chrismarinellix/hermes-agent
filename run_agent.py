@@ -988,6 +988,10 @@ class AIAgent:
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
         
+        # Tool result persistence (Layer 2+3)
+        from tools.tool_result_storage import get_storage_dir as _get_tool_storage_dir
+        self._tool_result_storage_dir = _get_tool_storage_dir(self.session_id)
+
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"
@@ -5826,15 +5830,14 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Truncate oversized results
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # L2: Persist oversized results to disk (data preserved, model can read_file)
+            from tools.tool_result_storage import maybe_persist_tool_result
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                storage_dir=self._tool_result_storage_dir,
+            )
 
             # Append tool result message in order
             tool_msg = {
@@ -5843,6 +5846,13 @@ class AIAgent:
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
+
+        # ── L3: Per-turn aggregate budget enforcement ─────────────────────
+        from tools.tool_result_storage import enforce_turn_budget
+        num_tools = len(parsed_calls)
+        if num_tools > 0:
+            turn_tool_msgs = messages[-num_tools:]
+            enforce_turn_budget(turn_tool_msgs, self._tool_result_storage_dir)
 
         # ── Budget pressure injection ────────────────────────────────────
         budget_warning = self._get_budget_warning(api_call_count)
@@ -6090,18 +6100,14 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Guard against tools returning absurdly large content that would
-            # blow up the context window. 100K chars ≈ 25K tokens — generous
-            # enough for any reasonable tool output but prevents catastrophic
-            # context explosions (e.g. accidental base64 image dumps).
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # L2: Persist oversized results to disk (data preserved, model can read_file)
+            from tools.tool_result_storage import maybe_persist_tool_result
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                storage_dir=self._tool_result_storage_dir,
+            )
 
             tool_msg = {
                 "role": "tool",
@@ -6133,6 +6139,14 @@ class AIAgent:
 
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
+
+        # ── L3: Per-turn aggregate budget enforcement ─────────────────
+        from tools.tool_result_storage import enforce_turn_budget as _enforce_budget
+        num_tools_seq = len(assistant_message.tool_calls)
+        if num_tools_seq > 0:
+            turn_tool_msgs_seq = [m for m in messages[-num_tools_seq * 2:]
+                                  if m.get("role") == "tool"]
+            _enforce_budget(turn_tool_msgs_seq, self._tool_result_storage_dir)
 
         # ── Budget pressure injection ─────────────────────────────────
         # After all tool calls in this turn are processed, check if we're
