@@ -11,7 +11,6 @@ import os
 import shlex
 import threading
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
