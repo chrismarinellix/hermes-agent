@@ -20,6 +20,7 @@ try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
+        CallbackQueryHandler,
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
@@ -37,6 +38,7 @@ except ImportError:
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
     Application = Any
+    CallbackQueryHandler = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
@@ -547,9 +549,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            # Handle inline keyboard button callbacks (update prompts)
+
+            # Inline keyboard callback queries (button taps)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-            
+
+
             # Start polling — retry initialize() for transient TLS resets
             try:
                 from telegram.error import NetworkError, TimedOut
@@ -750,14 +754,22 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        Metadata keys consumed:
+          thread_id          – forum topic thread
+          silent             – send without notification sound (bool)
+          disable_preview    – suppress link preview (bool)
+          protect_content    – prevent forwarding/copying (bool)
+          reply_markup       – InlineKeyboardMarkup or ReplyKeyboardMarkup
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -770,9 +782,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
                 ]
-            
+
             message_ids = []
             thread_id = metadata.get("thread_id") if metadata else None
+            silent = bool(metadata.get("silent")) if metadata else False
+            disable_preview = bool(metadata.get("disable_preview")) if metadata else False
+            protect_content = bool(metadata.get("protect_content")) if metadata else False
+            reply_markup = metadata.get("reply_markup") if metadata else None
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -798,6 +814,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 for _send_attempt in range(3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
+                        # Extra kwargs for rich send options
+                        _extra_kw = {}
+                        if silent:
+                            _extra_kw["disable_notification"] = True
+                        if disable_preview:
+                            _extra_kw["disable_web_page_preview"] = True
+                        if protect_content:
+                            _extra_kw["protect_content"] = True
+                        # Only attach reply_markup to the last chunk
+                        if reply_markup and i == len(chunks) - 1:
+                            _extra_kw["reply_markup"] = reply_markup
+
                         try:
                             msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
@@ -805,6 +833,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
+                                **_extra_kw,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -817,6 +846,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
+                                    **_extra_kw,
                                 )
                             else:
                                 raise
@@ -1008,41 +1038,79 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
-    async def _handle_callback_query(
-        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
-    ) -> None:
-        """Handle inline keyboard button clicks (update prompts)."""
-        query = update.callback_query
-        if not query or not query.data:
-            return
-        data = query.data
-        if not data.startswith("update_prompt:"):
-            return
-        answer = data.split(":", 1)[1]  # "y" or "n"
-        await query.answer(text=f"Sent '{answer}' to the update process.")
-        # Edit the message to show the choice and remove buttons
-        label = "Yes" if answer == "y" else "No"
-        try:
-            await query.edit_message_text(
-                text=f"⚕ Update prompt answered: *{label}*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=None,
-            )
-        except Exception:
-            pass  # non-fatal if edit fails
-        # Write the response file
-        try:
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            response_path = home / ".update_response"
-            tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer)
-            tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s",
-                        answer, getattr(query.from_user, "id", "unknown"))
-        except Exception as exc:
-            logger.error("Failed to write update response from callback: %s", exc)
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent message.
 
+        Useful for cleaning up stale status messages, outdated lists,
+        or superseded progress updates.  Bots can only delete their own
+        messages or messages in groups where they have delete permission.
+        """
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception as e:
+            logger.debug("[%s] Failed to delete message %s: %s", self.name, chat_id, e)
+            return False
+
+    async def pin_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        silent: bool = True,
+    ) -> bool:
+        """Pin a message in a chat.
+
+        Useful for marking important responses, summaries, or persistent
+        reference material.  ``silent=True`` (default) avoids notifying
+        all chat members.
+        """
+        if not self._bot:
+            return False
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                disable_notification=silent,
+            )
+            return True
+        except Exception as e:
+            logger.debug("[%s] Failed to pin message %s: %s", self.name, chat_id, e)
+            return False
+
+    async def edit_reply_markup(
+        self,
+        chat_id: str,
+        message_id: str,
+        reply_markup=None,
+    ) -> SendResult:
+        """Update only the inline keyboard on a message (text stays the same).
+
+        Pass ``reply_markup=None`` to remove all buttons.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                reply_markup=reply_markup,
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return SendResult(success=True, message_id=message_id)
+            logger.debug("[%s] Failed to edit reply markup %s: %s", self.name, message_id, e)
+            return SendResult(success=False, error=str(e))
     async def send_voice(
         self,
         chat_id: str,
@@ -1338,7 +1406,36 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
-    
+
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str = "\U0001f44d",  # 👍
+    ) -> bool:
+        """Add an emoji reaction to a message (Bot API 7.3+).
+
+        Useful for acknowledging a user's message while the agent thinks.
+        Falls back silently if the bot lacks permission or the API version
+        doesn't support reactions.
+        """
+        if not self._bot:
+            return False
+        try:
+            from telegram import ReactionTypeEmoji
+            await self._bot.set_message_reaction(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+            return True
+        except ImportError:
+            logger.debug("[%s] ReactionTypeEmoji not available in this telegram lib version", self.name)
+            return False
+        except Exception as e:
+            logger.debug("[%s] Failed to set reaction on %s/%s: %s", self.name, chat_id, message_id, e)
+            return False
+
     def format_message(self, content: str) -> str:
         """
         Convert standard markdown to Telegram MarkdownV2 format.
@@ -1660,10 +1757,92 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(update.message, is_command=True):
             return
-        
+
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
-    
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button taps.
+
+        When a user taps an InlineKeyboardButton, Telegram sends a
+        CallbackQuery with the button's ``callback_data``.  We acknowledge
+        it immediately (required by Telegram API) and then dispatch it as
+        a regular text MessageEvent so the agent processes it like typed
+        input.
+        """
+        query = update.callback_query
+        if not query or not query.data:
+            return
+
+        # Handle update_prompt: callbacks — write response file for /update watcher
+        if query.data.startswith("update_prompt:"):
+            answer = query.data.split(":", 1)[1]  # "y" or "n"
+            await query.answer(text=f"Sent '{answer}' to the update process.")
+            label = "Yes" if answer == "y" else "No"
+            try:
+                await query.edit_message_text(
+                    text=f"⚕ Update prompt answered: *{label}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            try:
+                from hermes_constants import get_hermes_home
+                home = get_hermes_home()
+                response_path = home / ".update_response"
+                tmp = response_path.with_suffix(".tmp")
+                tmp.write_text(answer)
+                tmp.replace(response_path)
+                logger.info("Telegram update prompt answered '%s' by user %s",
+                            answer, getattr(query.from_user, "id", "unknown"))
+            except Exception as exc:
+                logger.error("Failed to write update response from callback: %s", exc)
+            return
+
+        # Acknowledge the button press so Telegram removes the spinner
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.warning("[%s] Failed to answer callback query: %s", self.name, e)
+
+        # Build a MessageEvent from the callback as if the user typed the data
+        message = query.message
+        user = query.from_user
+        chat = message.chat if message else None
+
+        if not chat or not user:
+            return
+
+        chat_type = "dm"
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            chat_type = "group"
+        elif chat.type == ChatType.CHANNEL:
+            chat_type = "channel"
+
+        thread_id_raw = getattr(message, "message_thread_id", None)
+        thread_id_str = str(thread_id_raw) if thread_id_raw else None
+
+        source = self.build_source(
+            chat_id=str(chat.id),
+            chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
+            chat_type=chat_type,
+            user_id=str(user.id),
+            user_name=user.full_name if user else None,
+            thread_id=thread_id_str,
+        )
+
+        event = MessageEvent(
+            text=query.data,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=message,
+            message_id=str(message.message_id) if message else None,
+            timestamp=message.date if message else None,
+        )
+
+        await self.handle_message(event)
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:

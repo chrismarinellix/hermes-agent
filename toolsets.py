@@ -60,8 +60,14 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Inline keyboard buttons for Telegram (gated on telegram lib via check_fn)
+    "send_inline_keyboard",
+    # Telegram message actions: delete, pin, remove buttons (gated on telegram lib)
+    "telegram_actions",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Email management (gated on EMAIL_ADDRESS etc. via check_fn)
+    "email",
 ]
 
 
@@ -200,6 +206,12 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "email": {
+        "description": "Email management: fetch with priority scoring, send, draft approval, semantic search (RAG), unsubscribe, commitment tracking",
+        "tools": ["email"],
         "includes": []
     },
 

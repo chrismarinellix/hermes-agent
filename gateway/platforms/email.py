@@ -75,6 +75,37 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
             return True
     return False
     
+_HIGH_SUBJECT_KW = (
+    "urgent", "action required", "asap", "deadline", "expires",
+    "expiring", "final notice", "overdue", "time sensitive",
+    "important:", "critical", "response needed",
+)
+_SKIP_SUBJECT_KW = (
+    "newsletter", "unsubscribe", "digest", "weekly", "monthly",
+    "roundup", "recap", "% off", "deal", "coupon", "promotion",
+)
+
+
+def _score_email_priority(sender: str, subject: str, headers: dict) -> str:
+    """Return 'skip' | 'low' | 'medium' | 'high' for inbound gateway messages."""
+    # Precedence/automated headers → low or skip
+    prec = headers.get("Precedence", "").lower()
+    if prec in ("bulk", "list", "junk"):
+        return "low"
+    if headers.get("X-Auto-Response-Suppress"):
+        return "skip"
+    if headers.get("List-Unsubscribe"):
+        return "low"
+
+    subj_l = subject.lower()
+    if any(k in subj_l for k in _HIGH_SUBJECT_KW):
+        return "high"
+    if any(k in subj_l for k in _SKIP_SUBJECT_KW):
+        return "skip"
+
+    return "medium"
+
+
 def check_email_requirements() -> bool:
     """Check if email platform dependencies are available."""
     addr = os.getenv("EMAIL_ADDRESS")
@@ -370,10 +401,17 @@ class EmailAdapter(BasePlatformAdapter):
                     subject = _decode_header_value(msg.get("Subject", "(no subject)"))
                     message_id = msg.get("Message-ID", "")
                     in_reply_to = msg.get("In-Reply-To", "")
+                    references = msg.get("References", "")
                     # Skip automated/noreply senders before any processing
                     msg_headers = dict(msg.items())
                     if _is_automated_sender(sender_addr, msg_headers):
                         logger.debug("[Email] Skipping automated sender: %s", sender_addr)
+                        continue
+
+                    # Priority scoring — skip low-value mail before body extraction
+                    priority = _score_email_priority(sender_addr, subject, msg_headers)
+                    if priority == "skip":
+                        logger.debug("[Email] Skipping low-priority email: %s / %s", sender_addr, subject)
                         continue
                     body = _extract_text_body(msg)
                     attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
@@ -385,6 +423,8 @@ class EmailAdapter(BasePlatformAdapter):
                         "subject": subject,
                         "message_id": message_id,
                         "in_reply_to": in_reply_to,
+                        "references": references,
+                        "priority": priority,
                         "body": body,
                         "attachments": attachments,
                         "date": msg.get("Date", ""),
@@ -431,10 +471,18 @@ class EmailAdapter(BasePlatformAdapter):
             if att["type"] == "image":
                 msg_type = MessageType.PHOTO
 
-        # Store thread context for reply threading
+        # Store thread context for proper RFC 2822 reply threading.
+        # Accumulate the References chain so every reply correctly threads
+        # the full conversation history, not just the latest message.
+        prev_refs = self._thread_context.get(sender_addr, {}).get("references", "")
+        prev_msg_id = self._thread_context.get(sender_addr, {}).get("message_id", "")
+        new_refs = msg_data.get("references", "")
+        # Build the accumulated chain: previous refs + any new refs + previous msg_id
+        ref_parts = " ".join(filter(None, [prev_refs, new_refs, prev_msg_id]))
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "references": ref_parts.strip(),
         }
 
         source = self.build_source(
@@ -494,11 +542,14 @@ class EmailAdapter(BasePlatformAdapter):
             subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        # Threading headers
+        # Threading headers — proper RFC 2822 chain
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+            # References = full prior chain + parent message-id
+            prior_refs = ctx.get("references", "")
+            ref_chain = f"{prior_refs} {original_msg_id}".strip()
+            msg["References"] = ref_chain
 
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
@@ -579,7 +630,9 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+            prior_refs = ctx.get("references", "")
+            ref_chain = f"{prior_refs} {original_msg_id}".strip()
+            msg["References"] = ref_chain
 
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id

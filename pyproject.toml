@@ -71,6 +71,11 @@ rl = [
   "uvicorn[standard]>=0.24.0,<1",
   "wandb>=0.15.0,<1",
 ]
+vector-store = [
+  "qdrant-client>=1.9.0,<2",
+  "sentence-transformers>=3.0.0,<4",
+  "numpy>=1.24.0,<3",
+]
 yc-bench = ["yc-bench @ git+https://github.com/collinear-ai/yc-bench.git ; python_version >= '3.12'"]
 all = [
   "hermes-agent[modal]",

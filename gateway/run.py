@@ -2240,7 +2240,16 @@ class GatewayRunner:
         
         # Set environment variables for tools
         self._set_session_env(context)
-        
+
+        # Acknowledge the message with a reaction so the user knows we're on it
+        if event.message_id and not event.is_command():
+            adapter = self.adapters.get(source.platform)
+            if adapter and hasattr(adapter, "react"):
+                try:
+                    await adapter.react(source.chat_id, event.message_id, "\U0001f440")  # 👀
+                except Exception:
+                    pass  # Non-critical — skip silently
+
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         try:
