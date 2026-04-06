@@ -373,11 +373,23 @@ def _action_fetch(args: dict) -> str:
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
-    return json.dumps({
+    result = json.dumps({
         "status": "ok",
         "count": len(results),
         "emails": results,
     }, default=str)
+
+    # Auto-index fetched emails into Qdrant in a background thread
+    if results:
+        import threading
+        def _bg_index():
+            try:
+                _action_index({"emails": results})
+            except Exception as exc:
+                logger.debug("Email auto-index skipped: %s", exc)
+        threading.Thread(target=_bg_index, daemon=True).start()
+
+    return result
 
 
 # ---------------------------------------------------------------------------

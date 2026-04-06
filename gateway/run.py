@@ -2994,8 +2994,14 @@ class GatewayRunner:
                         )
                 return None
 
+            # Background: index this exchange into Qdrant interactions store
+            if response:
+                asyncio.create_task(
+                    self._index_interaction(event, source, message_text, response)
+                )
+
             return response
-            
+
         except Exception as e:
             # Stop typing indicator on error too
             try:
@@ -4044,7 +4050,38 @@ class GatewayRunner:
 
         return True
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _index_interaction(
+        self, event: "MessageEvent", source, user_content: str, assistant_content: str
+    ) -> None:
+        """Fire-and-forget: store user+assistant exchange in Qdrant interactions collection."""
+        try:
+            from plugins.vector_store.qdrant.client import QdrantClientManager
+            from plugins.vector_store.qdrant.embeddings import EmbeddingModel
+            from plugins.vector_store.qdrant.interactions import InteractionsIndexer
+            from datetime import datetime, timezone
+
+            mgr = QdrantClientManager()
+            mgr.connect()
+            try:
+                indexer = InteractionsIndexer(mgr, EmbeddingModel())
+                indexer.index_exchange(
+                    platform=source.platform,
+                    conversation_id=getattr(source, "chat_id", "unknown"),
+                    user_content=user_content,
+                    assistant_content=assistant_content,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    user_id=getattr(source, "user_id", None),
+                    user_name=getattr(source, "user_name", None),
+                    chat_id=getattr(source, "chat_id", None),
+                    chat_name=getattr(source, "chat_name", None),
+                    tags=[source.platform],
+                )
+            finally:
+                mgr.disconnect()
+        except Exception as exc:
+            logger.debug("Interaction indexing skipped: %s", exc)
+
+    async def _send_voice_reply(self, event: "MessageEvent", text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
         audio_path = None
