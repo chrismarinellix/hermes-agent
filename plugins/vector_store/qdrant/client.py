@@ -105,9 +105,11 @@ class QdrantClientManager:
 
     def collection_info(self) -> dict:
         info = self.client.get_collection(self.collection)
+        # vectors_count was deprecated in qdrant-client >= 1.7 in favour of points_count
+        vectors_count = getattr(info, "vectors_count", None) or getattr(info, "points_count", 0)
         return {
             "name": self.collection,
-            "vectors_count": info.vectors_count,
+            "vectors_count": vectors_count,
             "points_count": info.points_count,
             "status": str(info.status),
         }
