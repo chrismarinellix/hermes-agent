@@ -68,6 +68,8 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Email management (gated on EMAIL_ADDRESS etc. via check_fn)
     "email",
+    # News indexing + semantic search via Qdrant (gated on QDRANT_URL via check_fn)
+    "index_news", "search_news", "news_collection_stats",
 ]
 
 
@@ -213,6 +215,12 @@ TOOLSETS = {
         "description": "Email management: fetch with priority scoring, send, draft approval, semantic search (RAG), unsubscribe, commitment tracking",
         "tools": ["email"],
         "includes": []
+    },
+
+    "news": {
+        "description": "AI/tech news: index articles into Qdrant vector store, semantic search across indexed corpus",
+        "tools": ["index_news", "search_news", "news_collection_stats"],
+        "includes": ["web"]
     },
 
 
